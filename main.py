@@ -3,10 +3,12 @@ import logging
 import subprocess
 import tempfile
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 
 import mss
+import mss.exception
 from nudenet import NudeDetector
 from PIL import Image
 from transformers import pipeline
@@ -14,15 +16,16 @@ from huggingface_hub import hf_hub_download
 import numpy as np
 from onnxruntime import InferenceSession
 
-SCREENSHOT_INTERVAL_SECONDS = 12
+SCREENSHOT_INTERVAL_SECONDS = 30
 LOGS_DIR = Path(__file__).parent / "logs"
 DETECTION_LOG = LOGS_DIR / "detections.log"
+CRASH_LOG = LOGS_DIR / "crash.log"
 
-FALCONSAI_THRESHOLD = 0.40
-ANIME_EXPLICIT_THRESHOLD = 0.10
-ANIME_QUESTIONABLE_THRESHOLD = 0.25
-NUDENET_EXPOSED_THRESHOLD = 0.45
-NUDENET_COVERED_THRESHOLD = 0.70
+FALCONSAI_THRESHOLD = 0.90
+ANIME_EXPLICIT_THRESHOLD = 0.9
+ANIME_QUESTIONABLE_THRESHOLD = 0.9
+NUDENET_EXPOSED_THRESHOLD = 0.90
+NUDENET_COVERED_THRESHOLD = 0.90
 
 NUDENET_EXPOSED_CLASSES = {
     "FEMALE_GENITALIA_EXPOSED",
@@ -96,11 +99,13 @@ def take_screenshot() -> Image.Image:
         return Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
 
 
-def enforce() -> None:
+def enforce(logoff: bool = False) -> None:
     for proc in BROWSER_PROCESSES:
         subprocess.run(["taskkill", "/F", "/IM", proc], capture_output=True)
     log.warning("Browsers closed.")
-    # subprocess.run(["shutdown", "/l", "/f"])
+    if logoff:
+        log.warning("Logging out user.")
+        subprocess.run(["shutdown", "/l", "/f"], capture_output=True)
 
 
 def _falconsai_score(nsfw_clf, img: Image.Image) -> float:
@@ -168,11 +173,36 @@ def log_detection(scores: dict) -> None:
     log.warning(f"Flagged: {line}")
 
 
+def _is_explicit(scores: dict) -> bool:
+    if scores.get('wd14_explicit', 0.0) >= ANIME_EXPLICIT_THRESHOLD:
+        return True
+    nudenet = scores.get('nudenet', '')
+    return any(cls in nudenet for cls in NUDENET_EXPOSED_CLASSES)
+
+
+def save_flagged_screenshot(img: Image.Image) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = LOGS_DIR / f"flagged_{timestamp}.png"
+    img.save(path, format="PNG")
+    log.warning(f"Screenshot saved: {path}")
+
+
 def check_nudity(nsfw_clf, wd_session, rating_indices, detector, img: Image.Image) -> None:
     flagged, scores = run_detection(nsfw_clf, wd_session, rating_indices, detector, img)
     if flagged:
         log_detection(scores)
-        enforce()
+        save_flagged_screenshot(img)
+        enforce(logoff=_is_explicit(scores))
+
+
+def log_crash(exc: BaseException) -> None:
+    CRASH_LOG.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] {type(exc).__name__}: {exc}\n{traceback.format_exc()}\n"
+    with CRASH_LOG.open("a", encoding="utf-8") as f:
+        f.write(entry)
+    log.error(f"Crash logged: {type(exc).__name__}: {exc}")
 
 
 def main() -> None:
@@ -181,11 +211,17 @@ def main() -> None:
     detector = NudeDetector()
     try:
         while True:
-            img = take_screenshot()
-            check_nudity(nsfw_clf, wd_session, rating_indices, detector, img)
+            try:
+                img = take_screenshot()
+                check_nudity(nsfw_clf, wd_session, rating_indices, detector, img)
+            except mss.exception.ScreenShotError:
+                pass
             time.sleep(SCREENSHOT_INTERVAL_SECONDS)
     except KeyboardInterrupt:
         pass
+    except Exception as exc:
+        log_crash(exc)
+        raise
 
 
 if __name__ == "__main__":
